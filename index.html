@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JLV135 Binary Diff Analyzer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <h1>JLV135 Binary Diff Analyzer</h1>
+        <p>
+          Загрузи два бинарных файла и получи структурированный анализ: блоки,
+          метрики, карта отличий и детальный hex/ASCII просмотр.
+        </p>
+      </header>
+
+      <section class="controls card">
+        <div class="file-inputs">
+          <label class="input-group">
+            <span>Файл A (базовый)</span>
+            <input id="fileA" type="file" />
+          </label>
+
+          <label class="input-group">
+            <span>Файл B (сравнение)</span>
+            <input id="fileB" type="file" />
+          </label>
+        </div>
+
+        <div class="settings-row">
+          <label>
+            Размер блока (байт)
+            <input id="blockSize" type="number" min="16" step="16" value="256" />
+          </label>
+          <label>
+            Байт в строке (hex-view)
+            <input id="bytesPerLine" type="number" min="8" max="64" step="8" value="16" />
+          </label>
+          <label class="checkbox-inline">
+            <input id="showOnlyChanged" type="checkbox" />
+            Показывать только изменённые блоки
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="analyzeBtn" class="primary">Анализировать</button>
+          <button id="resetBtn" class="ghost">Сбросить</button>
+        </div>
+
+        <div id="status" class="status">Ожидание загрузки файлов.</div>
+      </section>
+
+      <section id="summary" class="summary-grid"></section>
+
+      <section class="content-grid">
+        <article class="card">
+          <h2>Карта блоков</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Диапазон</th>
+                  <th>Статус</th>
+                  <th>Δ байт</th>
+                  <th>Δ %</th>
+                  <th>1-е отличие</th>
+                  <th>Последнее отличие</th>
+                </tr>
+              </thead>
+              <tbody id="blocksTableBody">
+                <tr>
+                  <td colspan="7" class="muted">Пока нет данных анализа.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Детализация выбранного блока</h2>
+          <div id="blockMeta" class="muted">Выбери блок в таблице для просмотра деталей.</div>
+          <div class="hex-columns">
+            <div>
+              <h3>Файл A</h3>
+              <pre id="hexA" class="hex-view"></pre>
+            </div>
+            <div>
+              <h3>Файл B</h3>
+              <pre id="hexB" class="hex-view"></pre>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

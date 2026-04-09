@@ -1,0 +1,3 @@
+cd "D:\JLV135\jlv135_v1_1(breezart-1.4.5-hf0-tech)+dump"
+pyinstaller --onefile --windowed --name=JLV135_Analyzer "dump_JLV135\jlv135_analyzer.py"
+copy "dist\JLV135_Analyzer.exe" "JLV135_Analyzer.exe"

@@ -9,6 +9,8 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import struct
 import os
 import sys
+import re
+import uuid
 from typing import List, Tuple, Dict
 
 class DumpAnalyzerGUI:
@@ -96,8 +98,8 @@ class DumpAnalyzerGUI:
                   command=self.detect_specific_errors).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(button_frame, text="Диагностика памяти", 
                   command=self.diagnose_memory).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(button_frame, text="Вывод дампа", 
-                  command=self.dump_full_hex).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(button_frame, text="Читаемый вывод", 
+                  command=self.human_readable_dump).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(button_frame, text="Очистить", 
                   command=self.clear_output).pack(side=tk.LEFT)
         
@@ -619,6 +621,199 @@ class DumpAnalyzerGUI:
         if len(data) > max_bytes:
             self.log(f"... (Выведено первые {max_bytes//1024} KB из {len(data)//1024} KB)")
         self.status_var.set("Вывод дампа завершен")
+
+    def extract_ascii_strings(self, min_len: int = 6, max_items: int = 40):
+        """Извлечь печатные ASCII строки из дампа с их адресами."""
+        if self.dump_data is None:
+            return []
+        pattern = re.compile(rb'[\x20-\x7E]{' + str(min_len).encode() + rb',}')
+        strings = []
+        for match in pattern.finditer(self.dump_data):
+            strings.append((match.start(), match.group().decode('ascii', errors='ignore')))
+            if len(strings) >= max_items:
+                break
+        return strings
+
+    def extract_mac_candidates(self, limit: int = 20):
+        """Поиск MAC-адресов в формате 6 последовательных байт."""
+        if self.dump_data is None:
+            return []
+        found = []
+        seen = set()
+        data = self.dump_data
+        for i in range(0, len(data) - 5):
+            chunk = data[i:i+6]
+            # Отсечь очевидный мусор
+            if chunk in (b'\x00'*6, b'\xFF'*6):
+                continue
+            first = chunk[0]
+            # Unicast + globally unique чаще всего:
+            # bit0=0 (unicast), bit1=0 (globally unique)
+            if (first & 0x01) != 0:
+                continue
+            mac_str = ':'.join(f"{b:02X}" for b in chunk)
+            if mac_str in seen:
+                continue
+            seen.add(mac_str)
+            found.append((i, mac_str))
+            if len(found) >= limit:
+                break
+        return found
+
+    def extract_guid_candidates(self, limit: int = 20):
+        """Поиск GUID/UUID как 16-байтных последовательностей."""
+        if self.dump_data is None:
+            return []
+        found = []
+        seen = set()
+        data = self.dump_data
+        for i in range(0, len(data) - 15):
+            raw = data[i:i+16]
+            if raw == b'\x00'*16 or raw == b'\xFF'*16:
+                continue
+            try:
+                guid = str(uuid.UUID(bytes=raw))
+            except ValueError:
+                continue
+            if guid in seen:
+                continue
+            seen.add(guid)
+            found.append((i, guid))
+            if len(found) >= limit:
+                break
+        return found
+
+    def extract_serial_candidates(self, min_len: int = 8, max_len: int = 32, limit: int = 30):
+        """Поиск похожих на серийный номер токенов в ASCII строках."""
+        serial_regex = re.compile(r'(?i)\b(?:sn|serial|id|guid|mac)?[:=_\- ]?([A-Z0-9][A-Z0-9\-]{' +
+                                  f'{min_len-1},{max_len-1}' + r'})\b')
+        candidates = []
+        for addr, s in self.extract_ascii_strings(min_len=6, max_items=300):
+            for m in serial_regex.finditer(s):
+                token = m.group(1)
+                # Слишком "обычные" слова отсекаем
+                if token.isalpha():
+                    continue
+                candidates.append((addr, token))
+                if len(candidates) >= limit:
+                    return candidates
+        return candidates
+
+    def human_readable_dump(self):
+        """Сформировать человеко-читаемый отчет по дампу."""
+        if not self.load_dump():
+            return
+
+        self.log("="*60)
+        self.log("ЧЕЛОВЕКО-ЧИТАЕМЫЙ РАЗБОР ДАМПА")
+        self.log("="*60)
+        self.log("Цель: не просто сравнить биты, а выделить осмысленные блоки и причины сбоев.")
+
+        file_size = len(self.dump_data)
+        self.log(f"\nРазмер дампа: {file_size:,} байт ({file_size/1024/1024:.2f} MB)")
+
+        # 1) Карта секторов и их состояние
+        self.log("\n--- Карта секторов (первые 256KB, шаг 4KB) ---")
+        sector = 0x1000
+        max_scan = min(file_size, 0x40000)
+        for start in range(0, max_scan, sector):
+            end = min(start + sector, file_size)
+            block = self.dump_data[start:end]
+            ff = block.count(b'\xFF') / len(block) * 100
+            zz = block.count(b'\x00') / len(block) * 100
+            state = "данные"
+            if ff > 98:
+                state = "стерт (0xFF)"
+            elif zz > 95:
+                state = "подозрительно нулевой"
+            self.log(f"0x{start:08X}-0x{end:08X}: FF={ff:5.1f}% 00={zz:5.1f}% -> {state}")
+
+        # 2) Векторы прерываний в понятном виде
+        self.log("\n--- Векторы запуска (что должно запустить МК) ---")
+        vectors = struct.unpack('<16I', self.dump_data[:64])
+        names = ["SP", "Reset", "NMI", "HardFault", "MemManage", "BusFault", "UsageFault",
+                 "Rsv", "Rsv", "Rsv", "Rsv", "SVCall", "DebugMon", "Rsv", "PendSV", "SysTick"]
+        for i, (name, value) in enumerate(zip(names, vectors)):
+            meaning = "ok"
+            if value in (0x00000000, 0xFFFFFFFF):
+                meaning = "критично: пустое значение"
+            self.log(f"{i:2d}. {name:10s} = 0x{value:08X} ({meaning})")
+
+        # 3) MAC / GUID / Serial кандидаты
+        self.log("\n--- Выделенные идентификаторы ---")
+        macs = self.extract_mac_candidates()
+        guids = self.extract_guid_candidates()
+        serials = self.extract_serial_candidates()
+
+        if macs:
+            self.log("MAC-кандидаты:")
+            for addr, mac in macs[:10]:
+                self.log(f"  0x{addr:08X}: {mac}")
+        else:
+            self.log("MAC-кандидаты не найдены")
+
+        if guids:
+            self.log("GUID/UUID-кандидаты:")
+            for addr, g in guids[:10]:
+                self.log(f"  0x{addr:08X}: {g}")
+        else:
+            self.log("GUID/UUID-кандидаты не найдены")
+
+        if serials:
+            self.log("SN/ID-кандидаты:")
+            for addr, sn in serials[:12]:
+                self.log(f"  0x{addr:08X}: {sn}")
+        else:
+            self.log("SN/ID-кандидаты не найдены")
+
+        # 4) Сигнатуры по секторам
+        self.log("\n--- Сигнатуры и контекст ---")
+        signatures = [b'boot', b'firmware', b'config', b'serial', b'guid', b'mac', b'ARM', b'NXP', b'Cortex']
+        found_any = False
+        low_data = self.dump_data.lower()
+        for sig in signatures:
+            pos = low_data.find(sig.lower())
+            if pos != -1:
+                found_any = True
+                preview = self.dump_data[max(0, pos-16):pos+32]
+                hex_preview = ' '.join(f"{b:02X}" for b in preview[:24])
+                self.log(f"'{sig.decode(errors='ignore')}' @0x{pos:08X} | контекст(hex): {hex_preview}")
+        if not found_any:
+            self.log("Явные текстовые сигнатуры не обнаружены.")
+
+        # 5) Сравнение с эталоном с объяснением
+        if self.reference_data is not None:
+            self.log("\n--- Сравнение с эталоном (объяснение различий) ---")
+            common = min(len(self.dump_data), len(self.reference_data))
+            diff = sum(1 for i in range(common) if self.dump_data[i] != self.reference_data[i])
+            pct = diff / common * 100 if common else 0
+            self.log(f"Отличается {diff:,} байт из {common:,} ({pct:.2f}%).")
+            self.log("Если отличия локальны в GUID/SN/MAC блоках — это обычно нормально.")
+            self.log("Если отличия вектора Reset/SP, boot-сектора и начале прошивки — вероятна причина нестарта.")
+
+        # 6) Что может не работать — гипотезы
+        self.log("\n--- Возможные причины, почему устройство не работает ---")
+        sp = vectors[0]
+        rh = vectors[1]
+        if sp in (0x0, 0xFFFFFFFF):
+            self.log("1) Stack Pointer невалиден: загрузка не стартует.")
+        if rh in (0x0, 0xFFFFFFFF):
+            self.log("2) Reset Handler отсутствует: нет точки входа.")
+        if all(b == 0xFF for b in self.dump_data[0x1000:0x2000]):
+            self.log("3) Начало прошивки стерто (0xFF) — прошивка неполная.")
+        if not any((sp in (0x0, 0xFFFFFFFF), rh in (0x0, 0xFFFFFFFF))):
+            self.log("Критичных проблем запуска в первых векторах не выявлено.")
+            self.log("Дальше проверяйте конфигурационные блоки, CRC/подписи и совместимость версии.")
+
+        # Небольшой hex-фрагмент для ручной проверки
+        self.log("\n--- Фрагмент HEX (первые 512 байт) ---")
+        for off in range(0, min(512, len(self.dump_data)), 16):
+            chunk = self.dump_data[off:off+16]
+            hx = ' '.join(f"{b:02X}" for b in chunk)
+            asc = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            self.log(f"0x{off:08X}: {hx:<48} {asc}")
+
+        self.status_var.set("Читаемый вывод завершен")
     
     def detect_specific_errors(self):
         """Поиск конкретных ошибок"""

@@ -8,6 +8,7 @@ const showOnlyChangedCheckbox = document.getElementById('showOnlyChanged');
 
 const statusEl = document.getElementById('status');
 const summaryEl = document.getElementById('summary');
+const humanReportEl = document.getElementById('humanReport');
 const tableBodyEl = document.getElementById('blocksTableBody');
 const blockMetaEl = document.getElementById('blockMeta');
 const hexAEl = document.getElementById('hexA');
@@ -32,6 +33,8 @@ function resetView() {
   fileBInput.value = '';
   currentAnalysis = null;
   summaryEl.innerHTML = '';
+  humanReportEl.innerHTML = 'Загрузите файлы и нажмите «Анализировать».';
+  humanReportEl.classList.add('muted');
   tableBodyEl.innerHTML = '<tr><td colspan="7" class="muted">Пока нет данных анализа.</td></tr>';
   blockMetaEl.textContent = 'Выбери блок в таблице для просмотра деталей.';
   hexAEl.textContent = '';
@@ -121,12 +124,218 @@ async function analyzeFiles() {
   };
 
   renderSummary(currentAnalysis);
+  renderHumanReadableReport(currentAnalysis);
   renderBlocksTable(currentAnalysis);
 
   const coverage = ((totalDiffBytes / maxLen) * 100).toFixed(2);
   setStatus(
     `Готово: блоков ${totalBlocks}, изменённых ${changedBlocks}, байтовых отличий ${totalDiffBytes} (${coverage}%).`,
   );
+}
+
+function renderHumanReadableReport(analysis) {
+  const reportA = buildReadableReportForFile(analysis.dataA, analysis.fileA.name, analysis.fileB.name);
+  const reportB = buildReadableReportForFile(analysis.dataB, analysis.fileB.name, analysis.fileA.name);
+
+  humanReportEl.classList.remove('muted');
+  humanReportEl.innerHTML = `
+    <div class="human-cols">
+      ${buildReportPanelHtml(reportA)}
+      ${buildReportPanelHtml(reportB)}
+    </div>
+  `;
+}
+
+function buildReportPanelHtml(report) {
+  return `
+    <article class="human-panel">
+      <h3>${escapeHtml(report.fileLabel)}</h3>
+      <div><b>Векторы:</b> ${escapeHtml(report.vectorsSummary)}</div>
+      <div><b>Причины риска:</b> ${escapeHtml(report.hypothesis)}</div>
+      <div><b>Сигнатуры:</b> ${escapeHtml(report.signaturesSummary)}</div>
+      <div><b>MAC:</b> ${escapeHtml(report.macSummary)}</div>
+      <div><b>GUID:</b> ${escapeHtml(report.guidSummary)}</div>
+      <div><b>SN/ID:</b> ${escapeHtml(report.serialSummary)}</div>
+      <div><b>Сектора:</b> ${escapeHtml(report.sectorsSummary)}</div>
+      <ul class="human-list">
+        ${report.highlights.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}
+      </ul>
+    </article>
+  `;
+}
+
+function buildReadableReportForFile(data, fileName, otherFileName) {
+  const vectors = parseVectors(data);
+  const macs = extractMacCandidates(data, 8);
+  const guids = extractGuidCandidates(data, 8);
+  const serials = extractSerialCandidates(data, 10);
+  const signatures = findSignatures(data, ['boot', 'firmware', 'config', 'serial', 'guid', 'mac', 'arm', 'nxp', 'cortex']);
+  const sectors = analyzeSectors(data, 0x1000, 0x20000);
+
+  const vectorsSummary = vectors
+    ? `SP=0x${hex(vectors.sp)}, Reset=0x${hex(vectors.reset)}`
+    : 'Недостаточно данных для таблицы векторов (нужно ≥ 64 байт).';
+
+  const badReasons = [];
+  if (vectors) {
+    if (vectors.sp === 0 || vectors.sp === 0xffffffff) badReasons.push('невалидный Stack Pointer');
+    if (vectors.reset === 0 || vectors.reset === 0xffffffff) badReasons.push('невалидный Reset Handler');
+  }
+  if (isAllFF(data, 0x1000, 0x2000)) badReasons.push('стёрто начало прошивки (0xFF)');
+  const hypothesis = badReasons.length
+    ? badReasons.join('; ')
+    : 'Критичных проблем старта по базовым признакам не видно.';
+
+  const changedSectorCount = sectors.filter((s) => s.state !== 'данные').length;
+  const sectorsSummary = `проверено ${sectors.length} (4KB), аномалий ${changedSectorCount}`;
+
+  const highlights = [
+    `Сравнивайте с ${otherFileName}: если отличаются только GUID/SN/MAC блоки — это часто норма.`,
+    `Если различия в векторах и в секторах 0x0000..0x1FFF — это частая причина "не стартует".`,
+    ...sectors.slice(0, 4).map((s) => `${s.range}: FF=${s.ff.toFixed(1)}%, 00=${s.zz.toFixed(1)}% → ${s.state}`),
+  ];
+
+  return {
+    fileLabel: fileName,
+    vectorsSummary,
+    hypothesis,
+    signaturesSummary: signatures.length ? signatures.map((s) => `${s.name}@0x${hex(s.pos)}`).join(', ') : 'не найдены',
+    macSummary: macs.length ? macs.map((m) => `0x${hex(m.pos)}=${m.value}`).join(', ') : 'не найдены',
+    guidSummary: guids.length ? guids.map((g) => `0x${hex(g.pos)}=${g.value}`).join(', ') : 'не найдены',
+    serialSummary: serials.length ? serials.map((s) => `0x${hex(s.pos)}=${s.value}`).join(', ') : 'не найдены',
+    sectorsSummary,
+    highlights,
+  };
+}
+
+function parseVectors(data) {
+  if (data.length < 64) return null;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return {
+    sp: dv.getUint32(0, true),
+    reset: dv.getUint32(4, true),
+  };
+}
+
+function extractMacCandidates(data, limit = 8) {
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i <= data.length - 6; i++) {
+    const b0 = data[i];
+    const candidate = data.slice(i, i + 6);
+    if (candidate.every((x) => x === 0x00) || candidate.every((x) => x === 0xff)) continue;
+    if ((b0 & 0x01) !== 0) continue;
+    const value = [...candidate].map((x) => x.toString(16).padStart(2, '0').toUpperCase()).join(':');
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push({ pos: i, value });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function extractGuidCandidates(data, limit = 8) {
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i <= data.length - 16; i++) {
+    const chunk = data.slice(i, i + 16);
+    if (chunk.every((x) => x === 0x00) || chunk.every((x) => x === 0xff)) continue;
+    const value = formatGuid(chunk);
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push({ pos: i, value });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function formatGuid(chunk) {
+  const h = [...chunk].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
+function extractSerialCandidates(data, limit = 10) {
+  const strings = extractAsciiStrings(data, 6, 300);
+  const regex = /(?:sn|serial|id|guid|mac)?[:=_\- ]?([A-Z0-9][A-Z0-9\-]{7,31})/gi;
+  const out = [];
+  for (const item of strings) {
+    let m;
+    while ((m = regex.exec(item.value)) !== null) {
+      if (/^[A-Z]+$/i.test(m[1])) continue;
+      out.push({ pos: item.pos, value: m[1] });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+function extractAsciiStrings(data, minLen = 6, maxItems = 300) {
+  const out = [];
+  let start = -1;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    const printable = v >= 32 && v <= 126;
+    if (printable && start < 0) start = i;
+    if ((!printable || i === data.length - 1) && start >= 0) {
+      const end = printable && i === data.length - 1 ? i + 1 : i;
+      if (end - start >= minLen) {
+        const bytes = data.slice(start, end);
+        out.push({ pos: start, value: String.fromCharCode(...bytes) });
+        if (out.length >= maxItems) return out;
+      }
+      start = -1;
+    }
+  }
+  return out;
+}
+
+function findSignatures(data, signatures) {
+  const text = new TextDecoder('latin1').decode(data).toLowerCase();
+  const out = [];
+  for (const sig of signatures) {
+    const pos = text.indexOf(sig.toLowerCase());
+    if (pos >= 0) out.push({ name: sig, pos });
+  }
+  return out;
+}
+
+function analyzeSectors(data, sectorSize = 0x1000, maxBytes = 0x20000) {
+  const out = [];
+  const limit = Math.min(maxBytes, data.length);
+  for (let start = 0; start < limit; start += sectorSize) {
+    const end = Math.min(start + sectorSize, limit);
+    const blk = data.slice(start, end);
+    const ff = (countByte(blk, 0xff) / blk.length) * 100;
+    const zz = (countByte(blk, 0x00) / blk.length) * 100;
+    let state = 'данные';
+    if (ff > 98) state = 'стерт (0xFF)';
+    else if (zz > 95) state = 'нулевой/подозрительный';
+    out.push({ range: `0x${hex(start)}..0x${hex(end - 1)}`, ff, zz, state });
+  }
+  return out;
+}
+
+function countByte(arr, value) {
+  let n = 0;
+  for (const x of arr) if (x === value) n += 1;
+  return n;
+}
+
+function isAllFF(data, start, end) {
+  if (start >= data.length) return false;
+  for (let i = start; i < Math.min(end, data.length); i++) {
+    if (data[i] !== 0xff) return false;
+  }
+  return true;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function classifyBlockStatus(start, end, lenA, lenB) {
